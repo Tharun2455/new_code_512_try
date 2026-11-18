@@ -1,0 +1,515 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+use work.ADAR1000_REGS_PKG.all;
+
+entity Power_Timing_Synchronizer is
+    port (
+        clk                     : in  std_logic;
+        arst_n                  : in  std_logic;
+        SOB                     : in  std_logic;
+        PRT                     : in  std_logic;
+        RST                     : in  std_logic;
+        Initialization_Done     : in  std_logic;
+        SPI_Done                : in  std_logic;
+
+        EN_N5V_DC_DC7149        : out std_logic;
+        EN_N28V_DC_DC7149       : out std_logic;
+        EN_P3_3V_DC_DC7149      : out std_logic;
+        BUFF_ENABLE_DC_DC       : out std_logic;
+        
+        BUFF_ENABLE_TX_TR_SW    : out std_logic;
+        BUFF_ENABLE_RX_G1_G2    : out std_logic;
+        BUFF_ENABLE_RX_G3_G4    : out std_logic;
+
+        TR_SW_G                 : out std_logic_vector(4 downto 1);
+
+        TX_EN_G1_G2             : out std_logic;
+        TX_EN_G3_G4             : out std_logic;
+
+        RX_EN_A1                : out std_logic;
+        RX_EN_A2                : out std_logic;
+        RX_EN_A3                : out std_logic;
+        RX_EN_A4                : out std_logic;
+        RX_EN_A5                : out std_logic;
+        RX_EN_A6                : out std_logic;
+        RX_EN_A7                : out std_logic;
+        RX_EN_A8                : out std_logic;        
+        RX_EN_A9                : out std_logic;
+        RX_EN_A10               : out std_logic;
+        RX_EN_A11               : out std_logic;
+        RX_EN_A12               : out std_logic;
+        RX_EN_A13               : out std_logic;
+        RX_EN_A14               : out std_logic;
+        RX_EN_A15               : out std_logic;
+        RX_EN_A16               : out std_logic;
+
+        FPGA_SPI_BUFF_CTRL_G    : out std_logic_vector(4 downto 1);
+
+        PA_ON                   : out std_logic_vector(4 downto 1);
+        TR                      : out std_logic_vector(4 downto 1);
+
+        new_cmd_valid           : in  std_logic;
+        spi_write               : out std_logic;
+        Soft_Reset              : out std_logic
+    );
+end Power_Timing_Synchronizer;
+
+architecture Behavioral of Power_Timing_Synchronizer is
+    --------------------------------------------------------------------
+    -- INTERNAL SIGNALS
+    --------------------------------------------------------------------
+    signal SOB_BUF : std_logic_vector(1 downto 0) := (others => '0');
+    signal SOB_RED : std_logic := '0';
+
+    signal TR_SW_G_INT         : std_logic_vector(4 downto 1);
+    
+    --------------------------------------------------------------------
+    -- INTERNAL SIGNALS
+    --------------------------------------------------------------------
+    signal RST_BUF : std_logic_vector(1 downto 0) := (others => '0');
+    signal RST_FED : std_logic := '0';
+    
+    signal RESET_CNT            : integer range 0 to 200 := 0;
+    
+    signal SOFT_RESET_N_INT     : std_logic := '1';
+    
+    --------------------------------------------------------------------
+    -- SOB BUFFER SIGNAL
+    --------------------------------------------------------------------
+    signal SOB_RISE_BUF : std_logic := '0';
+    
+    type state_t is (IDLE, WAIT_SOB, DONE);
+    signal state : state_t;
+    
+    --------------------------------------------------------------------
+    -- 1 us RESET COUNT
+    -- Example:
+    -- 100 MHz clock -> 100 cycles = 1 us
+    --------------------------------------------------------------------
+    constant RESET_1US_COUNT : integer := 100;
+
+begin
+
+    --------------------------------------------------------------------
+    -- POWER ENABLES
+    -- ALWAYS ENABLED AFTER BOARD POWER UP
+    --------------------------------------------------------------------
+    EN_N5V_DC_DC7149  <= '1';
+    EN_N28V_DC_DC7149 <= '1';
+    EN_P3_3V_DC_DC7149 <= '1';
+    --------------------------------------------------------------------
+    -- BUFFER CONTROL
+    -- ACTIVE LOW -> KEEP ALWAYS ENABLED
+    --------------------------------------------------------------------
+    FPGA_SPI_BUFF_CTRL_G <= (others => '0');
+    BUFF_ENABLE_RX_G1_G2 <= '0';
+    BUFF_ENABLE_RX_G3_G4 <= '0';
+    BUFF_ENABLE_TX_TR_SW <= '0';
+    BUFF_ENABLE_DC_DC <= '0';
+
+    ------------------------------------------------------------------
+    -- ADAR GROUP SELECTION
+    ------------------------------------------------------------------
+    process(clk, arst_n)
+    begin
+        if arst_n = '0' then
+            ADAR_GROUP <= 0;
+        elsif rising_edge(clk) then
+            if (ADAR_NUMBER_CURRENT = 1 or ADAR_NUMBER_CURRENT = 2 or ADAR_NUMBER_CURRENT = 5 or ADAR_NUMBER_CURRENT = 6) then
+                ADAR_GROUP <= 1;
+            elsif (ADAR_NUMBER_CURRENT = 3 or ADAR_NUMBER_CURRENT = 4 or ADAR_NUMBER_CURRENT = 7 or ADAR_NUMBER_CURRENT = 8) then
+                ADAR_GROUP <= 2;
+            elsif (ADAR_NUMBER_CURRENT = 9 or ADAR_NUMBER_CURRENT = 10 or ADAR_NUMBER_CURRENT = 13 or ADAR_NUMBER_CURRENT = 14) then
+                ADAR_GROUP <= 3;
+            elsif (ADAR_NUMBER_CURRENT = 11 or ADAR_NUMBER_CURRENT = 12 or ADAR_NUMBER_CURRENT = 15 or ADAR_NUMBER_CURRENT = 16) then
+                ADAR_GROUP <= 4;
+            end if;
+        end if;
+    end process;
+    
+    --process(ADAR_NUMBER_NEXT)
+    --begin
+        --if (ADAR_NUMBER_NEXT = 1 or ADAR_NUMBER_NEXT = 2 or ADAR_NUMBER_NEXT = 5 or ADAR_NUMBER_NEXT = 6) then
+            --ADAR_GROUP <= 1;
+        --elsif (ADAR_NUMBER_NEXT = 3 or ADAR_NUMBER_NEXT = 4 or ADAR_NUMBER_NEXT = 7 or ADAR_NUMBER_NEXT = 8) then
+            --ADAR_GROUP <= 2;
+        --elsif (ADAR_NUMBER_NEXT = 9 or ADAR_NUMBER_NEXT = 10 or ADAR_NUMBER_NEXT = 13 or ADAR_NUMBER_NEXT = 14) then
+            --ADAR_GROUP <= 3;
+        --elsif (ADAR_NUMBER_NEXT = 11 or ADAR_NUMBER_NEXT = 12 or ADAR_NUMBER_NEXT = 15 or ADAR_NUMBER_NEXT = 16) then
+            --ADAR_GROUP <= 4;
+        --end if;
+    --end process;
+    
+    --------------------------------------------------------------------
+    -- SOB RISING EDGE DETECTION
+    --------------------------------------------------------------------
+    SOB_RED <= '1' when SOB_BUF(1) = '0' and SOB_BUF(0) = '1' else '0';
+    process(clk, arst_n)
+    begin
+        if arst_n = '0' then
+            SOB_BUF <= (others => '0');
+            SOB_RISE_BUF <= '0';
+        elsif rising_edge(clk) then
+            SOB_BUF <= SOB_BUF(0) & SOB;
+            SOB_RISE_BUF <= SOB_RED;
+        end if;
+    end process;
+ 
+    --------------------------------------------------------------------
+    -- LOAD CURRENT REGISTERS INTO ADAR - SPI WRITE ENABLE
+    --------------------------------------------------------------------
+    process(clk, arst_n)
+    begin
+        if arst_n = '0' then
+            state     <= IDLE;
+            spi_write <= '0';
+        elsif rising_edge(clk) then
+            case state is
+                -- State 1: Wait for a new command
+                when IDLE =>
+                    spi_write <= '0';
+
+                    if new_cmd_valid = '1' then
+                        state <= WAIT_SOB;
+                    end if;
+
+                -- State 2: Wait for SOB_RISE
+                when WAIT_SOB =>
+                    --spi_write <= '0';
+
+                    if SOB_RED = '1' then
+                        spi_write <= '1';
+                        state <= DONE;
+                    end if;
+
+                -- State 3: Done
+                when DONE =>
+                    spi_write <= '0';
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+    
+    --------------------------------------------------------------------
+    -- LOAD NEXT REGISTERS INTO CURRENT REGISTERS
+    -- AT SOB RISING EDGE
+    --------------------------------------------------------------------
+    process(clk, arst_n)
+    begin
+        if arst_n = '0' then
+            CURRENT_HEADER       <= (others => '0');
+            CURRENT_PKT_SIZE     <= (others => '0');
+            CURRENT_CMD_TYPE     <= (others => '0');
+            CURRENT_ACK_BYTE     <= (others => '0');
+            CURRENT_DWELL_MSG_ID <= (others => '0');
+            CURRENT_RESERVE      <= (others => (others => '0'));
+            CURRENT_CHECKSUM     <= (others => '0');
+            trx_reg_current      <= (others => (others => (others => '0')));
+        elsif rising_edge(clk) then
+            if SOB_RED = '1' then
+                CURRENT_HEADER       <= NEXT_HEADER;
+                CURRENT_PKT_SIZE     <= NEXT_PKT_SIZE;
+                CURRENT_CMD_TYPE     <= NEXT_CMD_TYPE;
+                CURRENT_ACK_BYTE     <= NEXT_ACK_BYTE;
+                CURRENT_DWELL_MSG_ID <= NEXT_DWELL_MSG_ID;
+                CURRENT_RESERVE      <= NEXT_RESERVE;
+                CURRENT_CHECKSUM     <= NEXT_CHECKSUM;
+                ADAR_NUMBER_CURRENT  <= ADAR_NUMBER_NEXT;
+                trx_reg_current      <= trx_reg_next;
+            end if;
+        end if;
+    end process;
+
+    --------------------------------------------------------------------
+    -- TR SWITCH CONTROL
+    --------------------------------------------------------------------
+    process(clk, arst_n)
+    begin
+        if arst_n = '0' then
+            TR_SW_G_INT <= (others => '0');
+        elsif rising_edge(clk) then
+            if SOB_RISE_BUF = '1' then
+                case CURRENT_CMD_TYPE is
+                    when CMD_DWELL => 
+                        TR_SW_G_INT <= (others => PRT);
+
+                    when CMD_RX_CAL =>
+                        TR_SW_G_INT <= (others => '0');
+                        
+                    when CMD_TX_CAL =>
+                        case ADAR_GROUP is
+                            when 1 =>
+                                TR_SW_G_INT <= "0001";
+                            when 2 =>
+                                TR_SW_G_INT <= "0010";
+                            when 3 =>
+                                TR_SW_G_INT <= "0100";
+                            when 4 =>
+                                TR_SW_G_INT <= "1000";
+                            when others =>
+                                null;
+                        end case;
+                    when others => null;
+                end case;
+            end if;
+        end if;
+    end process;
+
+    TR_SW_G <= TR_SW_G_INT;
+
+    --------------------------------------------------------------------
+    -- TX ENABLE CONTROL
+    --------------------------------------------------------------------
+    TX_EN_G1_G2 <= '1';
+    TX_EN_G3_G4 <= '1';
+    --process(clk, arst_n)
+    --begin
+        --if arst_n = '0' then
+            --TX_EN_G1_G2 <= '0';
+            --TX_EN_G3_G4 <= '0';
+        --elsif rising_edge(clk) then
+            --if SPI_Done = '1' then
+                --if CURRENT_CMD_TYPE = CMD_DWELL then
+                    --TX_EN_G1_G2 <= '1';
+                    --TX_EN_G3_G4 <= '1';
+                --elsif CURRENT_CMD_TYPE = CMD_TX_CAL then
+                    --case ADAR_GROUP is
+                        --when 1 | 2 =>
+                            --TX_EN_G1_G2 <= '1';
+                            --TX_EN_G3_G4 <= '0';
+                        --when 3 | 4 =>
+                            --TX_EN_G1_G2 <= '0';
+                            --TX_EN_G3_G4 <= '1';
+                        --when others =>
+                            --TX_EN_G1_G2 <= '0';
+                            --TX_EN_G3_G4 <= '0';
+                    --end case;
+                --else
+                    --TX_EN_G1_G2 <= '0';
+                    --TX_EN_G3_G4 <= '0';   
+                --end if;
+            --end if;
+        --end if;
+    --end process;
+
+    --------------------------------------------------------------------
+    -- RX ENABLE CONTROL
+    --------------------------------------------------------------------
+    process(clk, arst_n)
+    begin
+        if arst_n = '0' then
+            RX_EN_A1   <= '0';
+            RX_EN_A2   <= '0';
+            RX_EN_A3   <= '0';
+            RX_EN_A4   <= '0';
+            RX_EN_A5   <= '0';
+            RX_EN_A6   <= '0';
+            RX_EN_A7   <= '0';
+            RX_EN_A8   <= '0';  
+            RX_EN_A9   <= '0';
+            RX_EN_A10  <= '0';
+            RX_EN_A11  <= '0';
+            RX_EN_A12  <= '0';            
+            RX_EN_A13  <= '0';
+            RX_EN_A14  <= '0';
+            RX_EN_A15  <= '0';
+            RX_EN_A16  <= '0';
+            
+        elsif rising_edge(clk) then
+            if SPI_Done = '1' then
+                if CURRENT_CMD_TYPE = CMD_DWELL then
+                    RX_EN_A1   <= '1';
+                    RX_EN_A2   <= '1';
+                    RX_EN_A3   <= '1';
+                    RX_EN_A4   <= '1';
+                    RX_EN_A5   <= '1';
+                    RX_EN_A6   <= '1';
+                    RX_EN_A7   <= '1';
+                    RX_EN_A8   <= '1';  
+                    RX_EN_A9   <= '1';
+                    RX_EN_A10  <= '1';
+                    RX_EN_A11  <= '1';
+                    RX_EN_A12  <= '1';            
+                    RX_EN_A13  <= '1';
+                    RX_EN_A14  <= '1';
+                    RX_EN_A15  <= '1';
+                    RX_EN_A16  <= '1';
+                elsif CURRENT_CMD_TYPE = CMD_RX_CAL then
+                    case ADAR_GROUP is
+                        when 1 =>
+                            RX_EN_A1   <= '1';
+                            RX_EN_A2   <= '1';
+                            RX_EN_A3   <= '0';
+                            RX_EN_A4   <= '0';
+                            RX_EN_A5   <= '1';
+                            RX_EN_A6   <= '1';
+                            RX_EN_A7   <= '0';
+                            RX_EN_A8   <= '0';  
+                            RX_EN_A9   <= '0';
+                            RX_EN_A10  <= '0';
+                            RX_EN_A11  <= '0';
+                            RX_EN_A12  <= '0';            
+                            RX_EN_A13  <= '0';
+                            RX_EN_A14  <= '0';
+                            RX_EN_A15  <= '0';
+                            RX_EN_A16  <= '0';
+                        when 2 =>
+                            RX_EN_A1   <= '0';
+                            RX_EN_A2   <= '0';
+                            RX_EN_A3   <= '1';
+                            RX_EN_A4   <= '1';
+                            RX_EN_A5   <= '0';
+                            RX_EN_A6   <= '0';
+                            RX_EN_A7   <= '1';
+                            RX_EN_A8   <= '1';  
+                            RX_EN_A9   <= '0';
+                            RX_EN_A10  <= '0';
+                            RX_EN_A11  <= '0';
+                            RX_EN_A12  <= '0';            
+                            RX_EN_A13  <= '0';
+                            RX_EN_A14  <= '0';
+                            RX_EN_A15  <= '0';
+                            RX_EN_A16  <= '0';
+                        when 3 =>
+                            RX_EN_A1   <= '0';
+                            RX_EN_A2   <= '0';
+                            RX_EN_A3   <= '0';
+                            RX_EN_A4   <= '0';
+                            RX_EN_A5   <= '0';
+                            RX_EN_A6   <= '0';
+                            RX_EN_A7   <= '0';
+                            RX_EN_A8   <= '0';  
+                            RX_EN_A9   <= '1';
+                            RX_EN_A10  <= '1';
+                            RX_EN_A11  <= '0';
+                            RX_EN_A12  <= '0';            
+                            RX_EN_A13  <= '1';
+                            RX_EN_A14  <= '1';
+                            RX_EN_A15  <= '0';
+                            RX_EN_A16  <= '0';
+                        when 4 =>
+                            RX_EN_A1   <= '0';
+                            RX_EN_A2   <= '0';
+                            RX_EN_A3   <= '0';
+                            RX_EN_A4   <= '0';
+                            RX_EN_A5   <= '0';
+                            RX_EN_A6   <= '0';
+                            RX_EN_A7   <= '0';
+                            RX_EN_A8   <= '0';  
+                            RX_EN_A9   <= '0';
+                            RX_EN_A10  <= '0';
+                            RX_EN_A11  <= '1';
+                            RX_EN_A12  <= '1';            
+                            RX_EN_A13  <= '0';
+                            RX_EN_A14  <= '0';
+                            RX_EN_A15  <= '1';
+                            RX_EN_A16  <= '1';
+                        when others =>
+                            null;
+                    end case;
+                end if;
+            end if;
+        end if;
+    end process;
+   
+    --------------------------------------------------------------------
+    -- PA_ON CONTROL
+    --------------------------------------------------------------------
+    PA_ON   <= (others => '1');
+    --process(clk, arst_n)
+    --begin
+        --if arst_n = '0' then
+            --PA_ON   <= (others => '0');
+        --elsif rising_edge(clk) then
+            --if CURRENT_CMD_TYPE = CMD_DWELL or CURRENT_CMD_TYPE = CMD_RX_PATTERN or CURRENT_CMD_TYPE = CMD_TX_PATTERN then
+                --PA_ON   <= (others => '1');
+            --elsif (SOB_RED = '1') and (CURRENT_CMD_TYPE = CMD_RX_CAL or CURRENT_CMD_TYPE = CMD_TX_CAL or CURRENT_CMD_TYPE = CMD_RX_ISOLATION or CURRENT_CMD_TYPE = CMD_TX_ISOLATION) then
+                --case ADAR_GROUP is
+                    --when 1 =>
+                        --PA_ON  <= "0001";
+                    --when 2 =>            
+                        --PA_ON  <= "0010";
+                    --when 3 =>            
+                        --PA_ON  <= "0100";
+                    --when 4 =>            
+                        --PA_ON  <= "1000";
+                    --when others =>
+                        --PA_ON   <= (others => '0');
+                --end case;
+            --end if;
+        --end if;
+    --end process;
+    
+    --------------------------------------------------------------------
+    -- TR CONTROL
+    -- TR FOLLOWS PRT
+    --------------------------------------------------------------------
+    process(clk, arst_n)
+    begin
+        if arst_n = '0' then
+            TR <= (others => '0');
+        elsif rising_edge(clk) then
+            if Initialization_Done = '1' then
+                if CURRENT_CMD_TYPE = CMD_DWELL or CURRENT_CMD_TYPE = CMD_RX_PATTERN or CURRENT_CMD_TYPE = CMD_TX_PATTERN then
+                    TR <= (others => PRT);
+                elsif CURRENT_CMD_TYPE = CMD_RX_CAL or CURRENT_CMD_TYPE = CMD_TX_CAL or CURRENT_CMD_TYPE = CMD_RX_ISOLATION or CURRENT_CMD_TYPE = CMD_TX_ISOLATION then
+                    case ADAR_GROUP is
+                        when 1 =>
+                            TR <= "000" & PRT;
+                        when 2 =>
+                            TR <= "00" & PRT & '0';
+                        when 3 =>
+                            TR <= '0' & PRT & "00";
+                        when 4 =>
+                            TR <= PRT & "000";
+                        when others =>
+                            TR <= (others => '0');
+                    end case;
+                end if;
+            end if;
+        end if;
+    end process;
+    
+    --------------------------------------------------------------------
+    -- FALLING EDGE DETECTION FOR RST
+    --------------------------------------------------------------------
+    RST_FED <= '1' when RST_BUF(1) = '0' and RST_BUF(0) = '1' else '0';
+    process(clk, arst_n)
+    begin
+        if arst_n = '0' then
+            RST_BUF <= (others => '0');
+            SOB_RISE_BUF <= '0';
+        elsif rising_edge(clk) then
+            RST_BUF <= RST_BUF(0) & RST;
+            SOB_RISE_BUF <= SOB_RED;
+        end if;
+    end process;
+    
+    --------------------------------------------------------------------
+    -- ACTIVE LOW SOFT RESET GENERATION
+    -- Generates 1 us LOW pulse after falling edge of RST
+    --------------------------------------------------------------------
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if RST_FED = '1' then
+                SOFT_RESET_N_INT <= '0';
+                RESET_CNT        <= 1;
+            elsif RESET_CNT > 0 then
+                if RESET_CNT < RESET_1US_COUNT then
+                    RESET_CNT <= RESET_CNT + 1;
+                else
+                    RESET_CNT        <= 0;
+                    SOFT_RESET_N_INT <= '1';
+                end if;
+            else    
+                SOFT_RESET_N_INT <= '1';
+            end if;
+        end if;
+    end process;
+    
+    Soft_Reset <= SOFT_RESET_N_INT;
+
+end Behavioral;
