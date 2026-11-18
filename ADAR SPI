@@ -1,0 +1,445 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+use work.ADAR1000_REGS_PKG.all;
+
+entity ADAR_SPI is
+    port(
+        clk        : in  std_logic;
+        arst_n     : in  std_logic;
+
+        SPI_Write  : in  std_logic;
+        SPI_clk_in : in  std_logic;
+
+        busy       : out std_logic;
+        init_done  : out std_logic;
+        done       : out std_logic;
+        
+        TX_LOAD    : out std_logic_vector(4 downto 1);
+        RX_LOAD    : out std_logic_vector(4 downto 1);
+
+        SCLK       : out std_logic_vector(4 downto 1);
+        SDIO       : out std_logic_vector(4 downto 1);
+        SDO        : in  std_logic_vector(4 downto 1);
+        CSB        : out std_logic_vector(4 downto 1)
+    );
+end entity;
+
+architecture Behavioral of ADAR_SPI is
+
+------------------------------------------------------------------
+-- CONSTANTS
+------------------------------------------------------------------
+constant CLK_DIV : integer := 10;   -- automate it
+constant LOAD_PULSE_WIDTH : integer := 10;
+constant SCLK_GAP_REQ     : integer := 16;
+
+------------------------------------------------------------------
+-- FSM
+------------------------------------------------------------------
+type state_type is (
+    IDLE,
+    CONDITIONAL_STATE,
+    WRITE_TRX,
+    NEXT_REG,
+    NEXT_ADAR,
+    LOAD_RX_TX,
+    COMPLETE
+);
+
+signal state : state_type := IDLE;
+signal RESET_SIGNAL     : std_logic := '0';
+------------------------------------------------------------------
+-- COUNTERS
+------------------------------------------------------------------
+signal bit_cnt    : integer range 0 to 23 := 23;
+signal trx_index  : integer range 0 to TRX_COUNT := 0;
+signal adar_num   : integer range 1 to ADAR_COUNT := 1;
+
+attribute db_probes : string;
+attribute db_probes of adar_num : signal is "true";
+
+------------------------------------------------------------------
+-- SPI REGISTERS
+------------------------------------------------------------------
+signal shift_reg  : std_logic_vector(23 downto 0) := (others => '0');
+signal spi_active : std_logic := '0';
+signal spi_start  : std_logic := '0';
+signal spi_done   : std_logic := '0';
+signal done_sig   : std_logic := '0';  
+signal init_phase_done : std_logic := '0';
+-- signals to synchronize the done signal from 10MHz to 100Mhz
+signal spi_done_meta  : std_logic := '0';
+signal spi_done_sync  : std_logic := '0';
+signal spi_done_prev  : std_logic := '0';
+signal spi_done_pulse : std_logic := '0';
+--signal SCLK_INT       : std_logic := '0';     
+signal SCLK_RISE      : std_logic := '0';
+signal SCLK_D         : std_logic := '0';
+signal done_toggle         : std_logic := '0';
+
+------------------------------------------------------------------
+-- GROUP SELECT
+------------------------------------------------------------------
+signal adar_group_number : integer range 0 to 3 := 0;
+
+------------------------------------------------------------------
+-- OUTPUT REGISTERS
+------------------------------------------------------------------
+signal sdio_i : std_logic_vector(4 downto 1) := (others => '0');
+signal csb_i  : std_logic_vector(4 downto 1) := (others => '1');
+--signal LOAD_SUB_STATE : integer range 0 to 2 := 0;
+type t_load_sub_state is (
+    RX_LOAD_PULSE,
+    WAIT_CYCLES,
+    TX_LOAD_PULSE
+);
+signal load_sub_state : t_load_sub_state := RX_LOAD_PULSE;
+signal LOAD_PULSE_CNT : integer range 0 to 10 := 0;
+signal SCLK_GAP_CNT   : integer range 0 to 16 := 0;
+signal TX_LOAD_INT        : std_logic_vector(4 downto 1) := (others => '0');
+signal RX_LOAD_INT        : std_logic_vector(4 downto 1) := (others => '0');
+
+-- 26-bit counter to achieve the 0.5s (50 million cycles) delay
+signal clk_cnt   : integer range 0 to 500000000 := 0;    --50000000 100000000
+signal bit_idx    : integer range 1 to 4 := 0;
+
+begin
+
+------------------------------------------------------------------
+-- ADAR GROUP SELECTION
+------------------------------------------------------------------
+process(clk, arst_n)
+begin
+    if arst_n = '0' then
+        adar_group_number <= 0;
+    elsif rising_edge(clk) then
+        if (adar_num = 1 or adar_num = 2 or adar_num = 5 or adar_num = 6) then
+            adar_group_number <= 0;
+        elsif (adar_num = 3 or adar_num = 4 or adar_num = 7 or adar_num = 8) then
+            adar_group_number <= 1;
+        elsif (adar_num = 9 or adar_num = 10 or adar_num = 13 or adar_num = 14) then
+            adar_group_number <= 2;
+        else
+            adar_group_number <= 3;
+        end if;
+    end if;
+end process;
+
+--------------------------------------------------------------------
+-- SCLK RISING EDGE DETECTION
+--------------------------------------------------------------------
+process(clk, arst_n)
+begin
+    if arst_n = '0' then
+        SCLK_D    <= '0';
+        SCLK_RISE <= '0';
+    elsif rising_edge(clk) then
+        SCLK_RISE <= '0';
+        if (SPI_clk_in = '1' and SCLK_D = '0') then
+            SCLK_RISE <= '1';
+        end if;
+        
+        SCLK_D <= SPI_clk_in;
+    end if;
+end process;
+
+------------------------------------------------------------------
+-- MAIN FSM
+------------------------------------------------------------------
+process(clk, arst_n)
+begin
+    if arst_n = '0' then
+        state       <= IDLE;
+        done_sig        <= '0';
+        trx_index  <= 0;
+        trx_index   <= 0;
+        adar_num    <= 1;
+        spi_start <= '0';       --spi_start <= '0';
+        RESET_SIGNAL <= '0';
+    elsif rising_edge(clk) then
+        case state is
+        ------------------------------------------------------------------
+        -- IDLE
+        ------------------------------------------------------------------
+        when IDLE =>
+            done_sig <= '0';
+            --adar_num <= 1;
+            LOAD_SUB_STATE <= RX_LOAD_PULSE;
+            if SPI_Write = '1' then
+                trx_index <= 0;
+                state <= CONDITIONAL_STATE;
+            else
+                null;
+            end if;
+            
+            if NEXT_RESERVE(0)(3 downto 0) = x"1" then
+                adar_num <= 1;   -- Starts at 1 (Sequence: 1, 2, 5, 6)
+            
+            elsif NEXT_RESERVE(0)(3 downto 0) = x"2" then
+                adar_num <= 3;   -- Jumps immediately to 3 (Sequence: 3, 4, 7, 8)
+            
+            elsif NEXT_RESERVE(0)(3 downto 0) = x"4" then
+                adar_num <= 9;   -- Jumps immediately to 9 (Sequence: 9, 10, 13, 14)
+            
+            elsif NEXT_RESERVE(0)(3 downto 0) = x"8" then
+                adar_num <= 11;  -- Jumps immediately to 11 (Sequence: 11, 12, 15, 16)
+            
+            elsif NEXT_RESERVE(0)(3 downto 0) = x"F" then
+                adar_num <= 1;   -- Starts at 1 (Sequence: 1 to 16)
+            
+            else
+                adar_num <= 1;   -- Safe default fallback
+            end if;  
+            
+        ------------------------------------------------------------------
+        -- CONDITIONAL_STATE
+        ------------------------------------------------------------------
+        when CONDITIONAL_STATE =>
+            if (NEXT_RESERVE(0)(3 downto 0) = x"0") and (NEXT_RESERVE(0)(7 downto 4) = INIT_EN_FLAG) then
+                trx_index <= 0;
+                state <= WRITE_TRX;
+            elsif (trx_index >= TRX_COUNT - 1) then
+                trx_index <= 0;
+                state <= NEXT_ADAR;
+            else
+                state <= WRITE_TRX;
+            end if;
+
+        ------------------------------------------------------------------
+        -- WRITE TRX REGISTERS
+        ------------------------------------------------------------------
+        when WRITE_TRX =>
+            shift_reg <= '0' & adar_addr(adar_num) & '0' & trx_addr(trx_index)(11 downto 0) & trx_reg_next(adar_num - 1)(trx_index);
+            spi_start <= '1';
+            state <= NEXT_REG;
+
+        ------------------------------------------------------------------
+        -- NEXT REGISTER
+        ------------------------------------------------------------------
+        when NEXT_REG =>
+            if spi_done_pulse = '1' then
+                spi_start <= '0';
+                if (NEXT_RESERVE(0)(7 downto 4) = x"1") and (NEXT_RESERVE(0)(3 downto 0) = x"0") then
+                    state <= NEXT_ADAR;
+                elsif (trx_index < TRX_COUNT - 1) then
+                    trx_index <= trx_index + 1;
+                    state <= WRITE_TRX;
+                else
+                    state <= CONDITIONAL_STATE;
+                end if;
+            end if;
+        
+        ------------------------------------------------------------------
+        -- NEXT ADAR
+        ------------------------------------------------------------------
+        when NEXT_ADAR =>
+            if (NEXT_RESERVE(0)(7 downto 4) = INIT_EN_FLAG) and ((adar_num = ADAR_COUNT) or
+            (NEXT_RESERVE(0)(3 downto 0) = x"1" and adar_num = 6) or
+            (NEXT_RESERVE(0)(3 downto 0) = x"2" and adar_num = 8) or
+            (NEXT_RESERVE(0)(3 downto 0) = x"4" and adar_num = 14)) then 
+            
+                state <= COMPLETE; 
+            
+            elsif ((NEXT_CMD_TYPE = CMD_RX_CAL) or (NEXT_CMD_TYPE = CMD_TX_CAL)) and (adar_num = ADAR_COUNT) then
+                state <= COMPLETE;
+                --
+            --elsif ((NEXT_CMD_TYPE = CMD_RX_PATTERN) or (NEXT_CMD_TYPE = CMD_TX_PATTERN)) and (adar_num = ADAR_COUNT) then
+                --state <= LOAD_RX_TX;           
+            
+            else 
+                case NEXT_RESERVE(0)(3 downto 0) is
+                    when x"0" =>
+                        adar_num <= adar_num + 1;
+                    
+                    when x"1" =>
+                        case adar_num is
+                            when 1      => adar_num <= 2;
+                            when 2      => adar_num <= 5;
+                            when 5      => adar_num <= 6;
+                            when others => adar_num <= 1;
+                        end case;
+            
+                    when x"2" =>
+                        case adar_num is
+                            when 3      => adar_num <= 4;
+                            when 4      => adar_num <= 7;
+                            when 7      => adar_num <= 8;
+                            when others => adar_num <= 3;
+                        end case;
+            
+                    when x"4" =>
+                        case adar_num is
+                            when 9      => adar_num <= 10;
+                            when 10     => adar_num <= 13;
+                            when 13     => adar_num <= 14;
+                            when others => adar_num <= 9;  
+                        end case;
+            
+                    when x"8" =>
+                        case adar_num is
+                            when 11     => adar_num <= 12;
+                            when 12     => adar_num <= 15;
+                            when 15     => adar_num <= 16; 
+                            when others => adar_num <= 11; 
+                        end case;
+            
+                    when x"F" =>
+                        adar_num <= adar_num + 1;
+            
+                    when others =>
+                        Null;
+                end case;
+            
+                state <= CONDITIONAL_STATE; 
+            end if;
+
+        ------------------------------------------------------------------
+        -- LOAD RX-TX
+        -- LOAD RX FIRST THEN TX
+        -- KEEP 8 SCLK GAP BETWEEN THEM
+        ------------------------------------------------------------------
+        when LOAD_RX_TX =>
+            case LOAD_SUB_STATE is
+                -- STATE 0 : RX_LOAD PULSE
+                when RX_LOAD_PULSE =>
+                    if LOAD_PULSE_CNT < LOAD_PULSE_WIDTH - 1 then
+                        LOAD_PULSE_CNT <= LOAD_PULSE_CNT + 1;
+                        if ((NEXT_CMD_TYPE = CMD_RX_PATTERN) or (NEXT_CMD_TYPE = CMD_RX_CAL)) then 
+                            -- Enable 1 bit at a time based on current loop index
+                            RX_LOAD_INT <= (others => '0');
+                            RX_LOAD_INT(bit_idx) <= '1';
+                        else
+                            RX_LOAD_INT <= (others => '0'); 
+                        end if;
+                    else
+                        LOAD_PULSE_CNT <= 0;
+                        RX_LOAD_INT    <= (others => '0');
+                        LOAD_SUB_STATE <= WAIT_CYCLES; -- Proceed to wait state
+                    end if;
+            
+                -- STATE 1 : WAIT 8 SCLK CYCLES
+                when WAIT_CYCLES =>
+                    if SCLK_RISE = '1' then
+                        if SCLK_GAP_CNT < SCLK_GAP_REQ - 1 then
+                            SCLK_GAP_CNT <= SCLK_GAP_CNT + 1;
+                        else
+                            SCLK_GAP_CNT   <= 0;
+                            LOAD_SUB_STATE <= TX_LOAD_PULSE;
+                        end if;
+                    end if;
+            
+                -- STATE 2 : TX_LOAD PULSE
+                when TX_LOAD_PULSE =>
+                    if LOAD_PULSE_CNT < LOAD_PULSE_WIDTH - 1 then
+                        LOAD_PULSE_CNT <= LOAD_PULSE_CNT + 1;
+                        if ((NEXT_CMD_TYPE = CMD_TX_PATTERN) or (NEXT_CMD_TYPE = CMD_TX_CAL)) then
+                            -- Enable 1 bit at a time based on current loop index
+                            TX_LOAD_INT <= (others => '0');
+                            TX_LOAD_INT(bit_idx) <= '1';
+                        else
+                            TX_LOAD_INT <= (others => '0');
+                        end if;
+                    else
+                        LOAD_PULSE_CNT <= 0;
+                        TX_LOAD_INT    <= (others => '0');
+                        
+                        -- DECISION LOGIC: Determine whether to loop or finish
+                        if bit_idx < 4 then
+                            -- If we haven't done all 4 bits, start the 0.5s delay timer
+                            if clk_cnt = 499999999 then --49999999 99999999
+                                clk_cnt        <= 0;
+                                bit_idx        <= bit_idx + 1;  -- Move to next bit
+                                LOAD_SUB_STATE <= RX_LOAD_PULSE; -- Loop back to start
+                            else
+                                clk_cnt        <= clk_cnt + 1;  -- Wait in this state until 0.5s passes
+                            end if;
+                        else
+                            -- All 4 bits done
+                            bit_idx        <= 1;
+                            clk_cnt        <= 0;
+                            state          <= COMPLETE; -- Go to your top-level final state
+                        end if;
+                    end if;
+            
+                when others =>
+                    LOAD_SUB_STATE <= RX_LOAD_PULSE;
+            
+            end case;
+
+        ------------------------------------------------------------------
+        -- COMPLETE
+        ------------------------------------------------------------------
+        when COMPLETE =>
+            RESET_SIGNAL <= '1';
+            done_sig  <= '1';
+            state <= IDLE;
+        
+        when others =>
+            null;
+        
+        end case;
+    end if;
+end process;
+
+SPI_SHIFT_ENGINE : process(SPI_clk_in, arst_n)
+begin
+    if arst_n = '0' then
+        bit_cnt     <= 23;
+        spi_done    <= '0';
+        spi_active  <= '0';
+        sdio_i      <= (others => '0');
+        csb_i       <= (others => '1');
+    elsif falling_edge(SPI_clk_in) then
+        -- Start SPI transaction
+        if (spi_start = '1' and spi_active = '0') then
+                spi_active <= '1';
+                csb_i(adar_group_number + 1) <= '0';        -- CSB LOW
+                bit_cnt <= 23;
+                sdio_i(adar_group_number + 1) <= shift_reg(23); -- First bit valid immediately
+                spi_done <= '0';
+        elsif spi_active = '1' then         -- SPI shifting
+            if bit_cnt = 0 then
+                spi_active <= '0';
+                csb_i(adar_group_number + 1) <= '1';    -- CSB HIGH after last bit
+                spi_done <= '1';
+            else
+                bit_cnt <= bit_cnt - 1;
+                sdio_i(adar_group_number + 1) <= shift_reg(bit_cnt - 1);
+                spi_done <= '0';
+            end if;
+        else
+            spi_done <= '0';
+        end if;
+    end if;
+end process;
+
+SPI_DONE_Synchronizer : process(clk, arst_n)
+begin
+    if arst_n = '0' then
+        spi_done_meta  <= '0';
+        spi_done_sync  <= '0';
+        spi_done_prev  <= '0';
+        spi_done_pulse <= '0';
+    elsif rising_edge(clk) then
+        -- two-flip-flop synchronizer
+        spi_done_meta <= spi_done;
+        spi_done_sync <= spi_done_meta;
+        -- edge detect
+        spi_done_pulse <= spi_done and not spi_done_prev;
+        spi_done_prev <= spi_done;
+    end if;
+end process;
+
+-- Concurrent Assignments
+done <= done_sig;
+init_done <= RESET_SIGNAL;
+SCLK <= (others => SPI_clk_in);
+SDIO <= sdio_i;
+CSB  <= csb_i;
+busy <= spi_active;
+TX_LOAD <= TX_LOAD_INT;
+RX_LOAD <= RX_LOAD_INT;
+
+end Behavioral;
