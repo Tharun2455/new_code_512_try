@@ -1,0 +1,500 @@
+LIBRARY ieee;
+use ieee.std_logic_1164.ALL;
+use ieee.numeric_std.all;
+
+entity UART_RX is
+    generic (
+		lsb_or_msb   : std_logic;                             -- 0:lsb 1:msb
+		uart_speed   : integer RANGE 0 to 10e6;               -- ex: 5000000 for 5mbps, 10000000 for 10mbps
+		sys_clock    : integer RANGE 0 to 100e6;              -- ex: 50000000 for 50MHz
+		uart_data_width_in_bit   : integer RANGE 0 to 16
+		);
+	port (
+		SYS_RESET       : in    std_logic;                    -- Global Reset
+		SYS_CLK		    : in    STD_LOGIC;
+		Serial_in       : in    std_logic;
+		data_out		: out   std_logic_vector( uart_data_width_in_bit-1 DOWNTO 0);
+		flag_new_data	: out   std_logic
+		);
+end UART_RX;
+
+architecture Behavioral of UART_RX is
+
+------------------------------------------------------------------
+-- Constants
+------------------------------------------------------------------
+constant CLKS_PER_BIT : integer := sys_clock/uart_speed;
+constant HALF_BIT_CLKS : integer := (CLKS_PER_BIT/2) - 1;
+constant LAST_DATA_BIT : integer := uart_data_width_in_bit - 1;
+------------------------------------------------------------------
+-- Signals
+------------------------------------------------------------------
+signal Serial_in_1, Serial_in_sync: std_logic := '1';
+signal clk_counter : integer := 0;
+signal bit_index : integer range -1 to uart_data_width_in_bit := 0;
+signal rx_shift_reg : std_logic_vector(uart_data_width_in_bit - 1 downto 0);
+signal data_out_s : std_logic_vector(uart_data_width_in_bit - 1 downto 0):= (others=>'0');
+signal flag_new_data_s : std_logic := '0';
+signal bit_step : integer := 1;
+------------------------------------------------------------------
+-- FSM for RX logic
+------------------------------------------------------------------
+type uart_rx_state_t is (
+    IDLE,               -- waiting for start bit
+    START_ALIGN,        -- wait half bit to align to center
+    RECEIVE_BITS,       -- receive data bits
+    DATA_LATCH,         -- transfer received data
+    STOP_BIT_CHECK,     -- verify stop bit
+    DATA_READY          -- generate new data flag
+);
+signal state_rx_uart : uart_rx_state_t := IDLE;
+
+begin
+------------------------------------------------------------------
+-- Synchronization to FPGA Clock
+------------------------------------------------------------------
+process (SYS_CLK)                                             
+begin
+    if rising_edge(SYS_CLK) then
+        Serial_in_1 <= Serial_in;
+        Serial_in_sync <= Serial_in_1;
+    end if;
+end process;
+
+------------------------------------------------------------------
+-- Process for LSB First and MSB First
+------------------------------------------------------------------
+process (SYS_CLK, SYS_RESET)
+begin
+    if SYS_RESET = '1' then
+        state_rx_uart   <= IDLE;
+        clk_counter     <= 0;
+        bit_index     <= 0;
+        flag_new_data_s <= '0';
+        rx_shift_reg    <= (others => '0');
+        data_out_s      <= (others => '0');
+    elsif rising_edge(SYS_CLK) then
+        case state_rx_uart is
+        ------------------------------------------------
+        -- IDLE : WAIT FOR START BIT
+        ------------------------------------------------
+        when IDLE =>
+            flag_new_data_s <= '0';
+            rx_shift_reg    <= (others => '0');
+            data_out_s      <= (others => '0');
+
+            if lsb_or_msb = '0' then
+                bit_index <= 0;
+                bit_step  <= 1;
+            else
+                bit_index <= LAST_DATA_BIT;
+                bit_step  <= -1;
+            end if;
+
+            if Serial_in_sync = '0' then
+                clk_counter   <= clk_counter + 1;
+                state_rx_uart <= START_ALIGN;
+            else
+                clk_counter <= 0;
+            end if;
+
+        ------------------------------------------------
+        -- WAIT HALF BIT TO ALIGN WITH CENTER
+        ------------------------------------------------    
+        when START_ALIGN =>
+            if clk_counter >= HALF_BIT_CLKS then
+                clk_counter   <= 0;
+                -- confirm start bit still LOW
+                if Serial_in_sync = '0' then
+                    state_rx_uart <= RECEIVE_BITS;
+                else
+                    state_rx_uart <= IDLE;                  -- **can raise a error here about abort and re-sending data
+                end if;
+            else
+                clk_counter <= clk_counter + 1;
+            end if;
+
+        ------------------------------------------------
+        -- RECEIVE DATA BITS
+        ------------------------------------------------
+        when RECEIVE_BITS =>
+            if (lsb_or_msb = '0' and bit_index > LAST_DATA_BIT) or
+                (lsb_or_msb = '1' and bit_index < 0) then
+                state_rx_uart <= DATA_LATCH;
+            end if;
+
+            -- clock counter
+            if clk_counter >= CLKS_PER_BIT - 1 then
+                clk_counter <= 0;
+            else
+                clk_counter <= clk_counter + 1;
+            end if;
+
+            -- bit counter
+            if clk_counter = CLKS_PER_BIT - 1 then
+                bit_index <= bit_index + bit_step;
+            end if;
+
+            -- sample data
+            if (clk_counter = CLKS_PER_BIT - 2) and ((lsb_or_msb = '0' and bit_index <= LAST_DATA_BIT) or
+                                                    (lsb_or_msb = '1' and bit_index >= 0)) then
+                rx_shift_reg(bit_index) <= Serial_in_sync;
+            end if;
+
+        ------------------------------------------------
+        -- MOVE DATA TO OUTPUT
+        ------------------------------------------------
+        when DATA_LATCH =>
+            state_rx_uart   <= STOP_BIT_CHECK;
+            clk_counter     <= 0;
+            data_out_s      <= rx_shift_reg;
+
+        ------------------------------------------------
+        -- CHECK STOP BIT
+        ------------------------------------------------
+        when STOP_BIT_CHECK =>
+            if clk_counter >= CLKS_PER_BIT - 1 then
+                if Serial_in_sync = '1' then
+                    state_rx_uart <= DATA_READY;
+                else
+                    state_rx_uart <= STOP_BIT_CHECK;
+                end if;
+            else
+                clk_counter <= clk_counter + 1;
+            end if;
+            data_out_s <= rx_shift_reg;
+
+        ------------------------------------------------
+        -- DATA READY PULSE
+        ------------------------------------------------
+        when DATA_READY =>
+            state_rx_uart   <= IDLE;
+            clk_counter     <= 0;
+            flag_new_data_s <= '1';
+            if lsb_or_msb = '0' then
+                bit_index <= 0;
+            else
+                bit_index <= LAST_DATA_BIT;
+            end if;
+
+        when others =>
+            state_rx_uart <= IDLE;
+        end case;
+    end if;
+end process;
+
+------------------------------------------------------------------
+-- Concurrent Assignments
+------------------------------------------------------------------
+data_out <= data_out_s;
+flag_new_data <= flag_new_data_s;
+
+end Behavioral;
+
+
+
+
+
+--LIBRARY ieee;
+--use ieee.std_logic_1164.ALL;
+--use ieee.numeric_std.all;
+
+--entity UART_RX is
+--    generic (
+--		lsb_or_msb   : std_logic;                             -- 0:lsb 1:msb
+--		uart_speed   : integer RANGE 0 to 10e6;               -- ex: 5000000 for 5mbps, 10000000 for 10mbps
+--		sys_clock    : integer RANGE 0 to 200e6;              -- ex: 50000000 for 50MHz
+--		uart_data_width_in_bit   : integer RANGE 0 to 16
+--		);
+--	port (
+--		SYS_RESET       : in    std_logic;                    -- Global Reset
+--		SYS_CLK		    : in    STD_LOGIC;
+--		Serial_in       : in    std_logic;
+--		data_out		: out   std_logic_VECTOR( uart_data_width_in_bit-1 DOWNTO 0);
+--		flag_new_data	: out   std_logic
+--		);
+--end UART_RX;
+
+--architecture Behavioral of UART_RX is
+
+--------------------------------------------------------------------
+---- Constants
+--------------------------------------------------------------------
+--constant CLKS_PER_BIT : integer := sys_clock/uart_speed;
+--constant HALF_BIT_CLKS : integer := (CLKS_PER_BIT/2) - 1;
+--constant LAST_DATA_BIT : integer := uart_data_width_in_bit - 1;
+--------------------------------------------------------------------
+---- Signals
+--------------------------------------------------------------------
+--signal Serial_in_1, Serial_in_sync: std_logic := '1';
+--signal clk_counter : integer := 0;
+--signal bit_index : integer := 0;
+--signal rx_shift_reg : std_logic_vector(uart_data_width_in_bit - 1 downto 0);
+--signal data_out_s : std_logic_vector(uart_data_width_in_bit - 1 downto 0):= (others=>'0');
+--signal flag_new_data_s : std_logic := '0';
+--------------------------------------------------------------------
+---- FSM for RX logic
+--------------------------------------------------------------------
+--type uart_rx_state_t is (
+--    IDLE,               -- waiting for start bit
+--    START_ALIGN,        -- wait half bit to align to center
+--    RECEIVE_BITS,       -- receive data bits
+--    DATA_LATCH,         -- transfer received data
+--    STOP_BIT_CHECK,     -- verify stop bit
+--    DATA_READY          -- generate new data flag
+--);
+--signal state_rx_uart : uart_rx_state_t := IDLE;
+
+--begin
+--------------------------------------------------------------------
+---- Synchronization to FPGA Clock
+--------------------------------------------------------------------
+--process (SYS_CLK)                                             
+--begin
+--    if rising_edge(SYS_CLK) then
+--        Serial_in_1 <= Serial_in;
+--        Serial_in_sync <= Serial_in_1;
+--    end if;
+--end process;
+
+--------------------------------------------------------------------
+---- Generate Process for LSB First 
+--------------------------------------------------------------------
+--LSB_FIRST_GENERATE:
+-- if lsb_or_msb='0' generate
+--begin
+--    process (SYS_CLK, SYS_RESET)
+--    begin
+--        if SYS_RESET = '1' then
+--            state_rx_uart   <= IDLE;
+--            clk_counter     <= 0;
+--            bit_index     <= 0;
+--            flag_new_data_s <= '0';
+--            rx_shift_reg    <= (others => '0');
+--            data_out_s      <= (others => '0');
+--        elsif rising_edge(SYS_CLK) then
+--            case state_rx_uart is
+--            ------------------------------------------------
+--            -- IDLE : WAIT FOR START BIT
+--            ------------------------------------------------
+--            when IDLE =>
+--                flag_new_data_s <= '0';
+--                bit_index     <= 0;
+--                rx_shift_reg    <= (others => '0');
+--                data_out_s      <= (others => '0');
+    
+--                if Serial_in_sync = '0' then
+--                    clk_counter   <= clk_counter + 1;
+--                    state_rx_uart <= START_ALIGN;
+--                else
+--                    clk_counter <= 0;
+--                end if;
+    
+--            ------------------------------------------------
+--            -- WAIT HALF BIT TO ALIGN WITH CENTER
+--            ------------------------------------------------    
+--            when START_ALIGN =>
+--                if clk_counter >= HALF_BIT_CLKS then
+--                    clk_counter   <= 0;
+--                    -- confirm start bit still LOW
+--                    if Serial_in_sync = '0' then
+--                        state_rx_uart <= RECEIVE_BITS;
+--                    else
+--                        state_rx_uart <= IDLE;                  -- **can raise a error here about abort and re-sending data
+--                    end if;
+--                else
+--                    clk_counter <= clk_counter + 1;
+--                end if;
+    
+--            ------------------------------------------------
+--            -- RECEIVE DATA BITS
+--            ------------------------------------------------
+--            when RECEIVE_BITS =>
+--                if bit_index > LAST_DATA_BIT then
+--                    state_rx_uart <= DATA_LATCH;
+--                end if;
+    
+--                -- clock counter
+--                if clk_counter >= CLKS_PER_BIT - 1 then
+--                    clk_counter <= 0;
+--                else
+--                    clk_counter <= clk_counter + 1;
+--                end if;
+    
+--                -- bit counter
+--                if clk_counter = CLKS_PER_BIT - 1 then
+--                    bit_index <= bit_index + 1;
+--                end if;
+    
+--                -- sample data
+--                if (clk_counter = CLKS_PER_BIT - 2) and (bit_index <= LAST_DATA_BIT) then
+--                    rx_shift_reg(bit_index) <= Serial_in_sync;
+--                end if;
+    
+--            ------------------------------------------------
+--            -- MOVE DATA TO OUTPUT
+--            ------------------------------------------------
+--            when DATA_LATCH =>
+--                state_rx_uart   <= STOP_BIT_CHECK;
+--                clk_counter     <= 0;
+--                data_out_s      <= rx_shift_reg;
+--                bit_index     <= 0;
+--                flag_new_data_s <= '0';
+    
+--            ------------------------------------------------
+--            -- CHECK STOP BIT
+--            ------------------------------------------------
+--            when STOP_BIT_CHECK =>
+--                if clk_counter >= CLKS_PER_BIT - 1 then
+--                    if Serial_in_sync = '1' then
+--                        flag_new_data_s <= '1';
+--                    else
+--                        flag_new_data_s <= '0';
+--                    end if;
+--                    state_rx_uart <= DATA_READY;
+--                else
+--                    clk_counter <= clk_counter + 1;
+--                    flag_new_data_s <= '0';
+--                end if;
+--                data_out_s <= rx_shift_reg;
+    
+--            ------------------------------------------------
+--            -- DATA READY PULSE
+--            ------------------------------------------------
+--            when DATA_READY =>
+--                state_rx_uart   <= IDLE;
+--                clk_counter     <= 0;
+--                flag_new_data_s <= '1';
+--                bit_index     <= 0;
+    
+--            when others =>
+--                state_rx_uart <= IDLE;
+--            end case;
+--        end if;
+--    end process;
+--end generate;
+
+--------------------------------------------------------------------
+---- Generate Process for MSB First
+--------------------------------------------------------------------
+--MSB_FIRST_GENERATE: if lsb_or_msb = '1' generate
+--begin
+--    process (SYS_CLK, SYS_RESET)
+--    begin
+--        if SYS_RESET = '1' then
+--            state_rx_uart   <= IDLE;
+--            clk_counter     <= 0;
+--            bit_index     <= LAST_DATA_BIT;
+--            flag_new_data_s <= '0';
+--            rx_shift_reg    <= (others => '0');
+--            data_out_s      <= (others => '0');
+
+--        elsif rising_edge(SYS_CLK) then
+--            case state_rx_uart is
+--            ------------------------------------------------
+--            -- IDLE : WAIT FOR START BIT
+--            ------------------------------------------------
+--            when IDLE =>
+--                flag_new_data_s <= '0';
+--                bit_index     <= LAST_DATA_BIT;
+--                rx_shift_reg    <= (others => '0');
+--                data_out_s      <= (others => '0');
+--                if Serial_in_sync = '0' then
+--                    clk_counter   <= clk_counter + 1;
+--                    state_rx_uart <= START_ALIGN;
+--                else
+--                    clk_counter <= 0;
+--                end if;
+
+--            ------------------------------------------------
+--            -- WAIT HALF BIT TO ALIGN WITH CENTER
+--            ------------------------------------------------
+--            when START_ALIGN =>
+--                if clk_counter >= HALF_BIT_CLKS then
+--                    clk_counter <= 0;
+--                    -- confirm start bit still LOW
+--                    if Serial_in_sync = '0' then
+--                        state_rx_uart <= RECEIVE_BITS;
+--                    else
+--                        state_rx_uart <= IDLE;
+--                    end if;
+--                else
+--                    clk_counter <= clk_counter + 1;
+--                end if;
+
+--            ------------------------------------------------
+--            -- RECEIVE DATA BITS
+--            ------------------------------------------------
+--            when RECEIVE_BITS =>
+--                if bit_index < 0 then
+--                    state_rx_uart <= DATA_LATCH;
+--                end if;
+                
+--                -- clock counter
+--                if clk_counter >= CLKS_PER_BIT - 1 then
+--                    clk_counter <= 0;
+--                else
+--                    clk_counter <= clk_counter + 1;
+--                end if;
+
+--                -- bit counter decrement
+--                if clk_counter = CLKS_PER_BIT - 1 then
+--                    bit_index <= bit_index - 1;
+--                end if;
+
+--                -- sample data
+--                if (clk_counter = CLKS_PER_BIT - 2) and (bit_index >= 0) then
+--                    rx_shift_reg(bit_index) <= Serial_in_sync;
+--                end if;
+
+--            ------------------------------------------------
+--            -- MOVE DATA TO OUTPUT
+--            ------------------------------------------------
+--            when DATA_LATCH =>
+--                state_rx_uart   <= STOP_BIT_CHECK;
+--                clk_counter     <= 0;
+--                data_out_s      <= rx_shift_reg;
+--                bit_index     <= LAST_DATA_BIT;
+--                flag_new_data_s <= '0';
+
+--            ------------------------------------------------
+--            -- CHECK STOP BIT
+--            ------------------------------------------------
+--            when STOP_BIT_CHECK =>
+--                if clk_counter >= CLKS_PER_BIT - 1 then
+--                    if Serial_in_sync = '1' then
+--                        flag_new_data_s <= '1';
+--                    else
+--                        flag_new_data_s <= '0';
+--                    end if;
+--                    state_rx_uart <= DATA_READY;
+--                else
+--                    clk_counter <= clk_counter + 1;
+--                    flag_new_data_s <= '0';
+--                end if;
+--                data_out_s <= rx_shift_reg;
+
+--            ------------------------------------------------
+--            -- DATA READY PULSE
+--            ------------------------------------------------
+--            when DATA_READY =>
+--                state_rx_uart   <= IDLE;
+--                clk_counter     <= 0;
+--                flag_new_data_s <= '1';
+--                bit_index     <= LAST_DATA_BIT;
+
+--            when others =>
+--                state_rx_uart <= IDLE;
+
+--            end case;
+--        end if;
+--    end process;
+--end generate;
+
+--------------------------------------------------------------------
+---- Concurrent Assignments
+--------------------------------------------------------------------
+--data_out <= data_out_s;
+--flag_new_data <= flag_new_data_s;
+
+--end Behavioral;
