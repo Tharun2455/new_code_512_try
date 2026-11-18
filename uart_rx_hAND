@@ -1,0 +1,599 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+use work.ADAR1000_REGS_PKG.all;
+
+entity UART_RX_HANDLER is
+    port (
+        clk             : in  std_logic;
+        arst_n          : in  std_logic;
+        RX_IN_10Mbps    : in  std_logic;
+        Send_ACK_EN     : out  std_logic;
+--        Start_Init      : out  std_logic;
+        CMD_Aquired     : out  std_logic
+    );
+end UART_RX_HANDLER;
+
+architecture Behavioral of UART_RX_HANDLER is
+
+------------------------------------------------------------------
+-- CONSTANTS
+------------------------------------------------------------------
+
+------------------------------------------------------------------
+-- RX Interface Signals - 115200
+------------------------------------------------------------------
+signal rx_data_10Mbps       : std_logic_vector(DATA_WIDTH-1 downto 0) := (others => '0');
+signal rx_valid_10Mbps      : std_logic := '0';
+signal RX_10Mbps_flag       : std_logic := '0';
+
+signal Byte_count_10Mbps    : integer range 0 to MAX_PACKET := 0;
+signal packet_size_10Mbps   : integer range 0 to MAX_PACKET := 0;
+signal Reserve_byte_count   : integer range 0 to ADAR_INDEX_WIDTH := 0;
+signal Cal_byte_count       : integer range 0 to ADAR_INDEX_WIDTH := 0;
+
+signal checksum_cal_10Mbps  : std_logic_vector(DATA_WIDTH - 1 downto 0) := (others => '0');
+signal checksum_cal_10Mbps_testing  : std_logic_vector(DATA_WIDTH - 1 downto 0) := (others => '0');
+
+type t_payload_state is (
+    ELEMENT_TRACKER,
+    ROW_COL_CALC,
+    ADAR_CALC,
+    LOCAL_CH_CALC,
+    DATA_UPDATE
+);
+signal payload_state        : t_payload_state := ELEMENT_TRACKER;
+
+signal ch_count             : unsigned(5 downto 0) := (others => '0');
+signal ch_byte_count        : integer range 0 to 4 := 0;
+signal tx_en_temp           : std_logic := '0';
+signal rx_en_temp           : std_logic := '0';
+
+-- Element index (0-based)
+signal element_idx          : unsigned(ELEMENT_WIDTH-1 downto 0) := (others => '0');
+
+-- Row / Column
+signal row                  : unsigned(2 downto 0) := (others => '0');
+signal col                  : unsigned(2 downto 0) := (others => '0');
+signal elem_u               : unsigned(7 downto 0) := (others => '0');
+
+-- ADAR index (0-based)
+signal adar_idx             : unsigned(ADAR_INDEX_WIDTH-1 downto 0) := (others => '0');
+
+-- Local mapping
+signal local_row            : std_logic := '0';
+signal local_col            : std_logic := '0';
+
+-- Channel inside ADAR (0 to 3)
+signal ch_local             : integer range 0 to 3 := 0;
+signal base_idx             : integer range 0 to (TRX_COUNT-1) := 0;
+
+-- Extracted enables
+signal tx_en                : std_logic := '0';
+signal rx_en                : std_logic := '0';
+--signal Start_Init_sig           : std_logic := '0';
+
+signal iso_byte_count       : integer range 0 to 3 := 0;
+signal iso_adar_idx         : integer range 0 to ADAR_COUNT-1 := 0;
+signal iso_ch_local         : integer range 0 to 3 := 0;
+signal adar_num             : integer range 1 to ADAR_COUNT := 1;
+
+    signal trx_reg_next_temp, trx_reg_next_temp2 : t_trx_all_adars := (
+        others => (
+            others => (others => '0')
+        )
+    );
+------------------------------------------------------------------
+-- FSM Definitions
+------------------------------------------------------------------
+type rx_state_t is (
+    IDLE,
+    HEADER,
+    IDENTIFIER,
+    COMMAND_TYPE,
+    ACK_TYPE,
+    DWELL_MSG_ID,
+    CMD_ACK_CHECK,
+    RESERVED,
+    DWELL_PATTERN_PAYLOAD,
+    CALIBRATION_PAYLOAD,
+    ISOLATION_PAYLOAD,
+    INITIALIZATION,
+    STATUS_PAYLOAD,
+    CHECKSUM,
+    DONE
+);
+signal rx_state_10Mbps : rx_state_t := IDLE;
+
+begin
+
+------------------------------------------------------------------
+-- UART RX (10Mbps)
+------------------------------------------------------------------
+UART_RX_10Mbps : entity work.UART_RX
+generic map(
+    lsb_or_msb => lsb_or_msb,
+    uart_speed => TILE_BAUD,
+    sys_clock  => SYS_CLK_FREQ,
+    uart_data_width_in_bit => DATA_WIDTH
+)
+port map(
+    SYS_RESET     => '0',
+    SYS_CLK       => clk,
+    Serial_in     => RX_IN_10Mbps,
+    data_out      => rx_data_10Mbps,
+    flag_new_data => rx_valid_10Mbps
+);
+
+
+-- for testing only
+trx_reg_next_temp <= trx_reg_next;
+trx_reg_next_temp2 <= trx_reg_const;
+checksum_cal_10Mbps_testing <= NEXT_RESERVE(0);
+
+
+
+------------------------------------------------------------------x------------------------------------------------------------------
+-- RX_10Mbps - Receiving Data from BCM/JIG
+------------------------------------------------------------------
+RX_Controller_10Mbps: process(clk)
+begin
+    if arst_n = '0' then
+        rx_state_10Mbps <= IDLE;
+    elsif rising_edge(clk) then
+        case rx_state_10Mbps is
+        ------------------------------------------------
+        -- Wait for Valid Signal
+        ------------------------------------------------
+        when IDLE =>
+            if rx_valid_10Mbps = '1' then
+                checksum_cal_10Mbps <= rx_data_10Mbps;     
+                NEXT_HEADER <= rx_data_10Mbps;     
+                Byte_count_10Mbps <= Byte_count_10Mbps + 1;
+                trx_reg_next <= trx_reg_const;                          -- Initialization of signal with constant values
+                NEXT_RESERVE <= (others => (others => '0'));
+                rx_state_10Mbps <= HEADER;
+            else
+                Byte_count_10Mbps <= 0;
+                checksum_cal_10Mbps <= (others => '0');
+                RX_10Mbps_flag <= '0';
+--                bram_we_10Mbps <= '0';
+            end if;
+
+        ------------------------------------------------
+        -- HEADER CHECK
+        ------------------------------------------------
+        when HEADER =>
+            if NEXT_HEADER = HEADER_BYTE then      
+                rx_state_10Mbps <= IDENTIFIER;
+            else
+                rx_state_10Mbps <= IDLE;                                -- Header Does not match
+            end if;
+
+        ------------------------------------------------
+        -- SIZE IDENTIFIER
+        ------------------------------------------------
+        when IDENTIFIER =>
+            if rx_valid_10Mbps = '1' then
+                NEXT_PKT_SIZE <= rx_data_10Mbps;
+                packet_size_10Mbps <= (to_integer(unsigned(rx_data_10Mbps)) * 5) + 10;       -- Implemeanting (5*n)+10 for counter
+                checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                Byte_count_10Mbps <= Byte_count_10Mbps + 1;
+                rx_state_10Mbps <= COMMAND_TYPE;
+            else
+                rx_state_10Mbps <= IDENTIFIER;
+            end if;
+
+        ------------------------------------------------
+        -- COMMAND TYPE                                               -- Required to Detect if the command type for the mode of operation
+        ------------------------------------------------
+        when COMMAND_TYPE =>
+            if rx_valid_10Mbps = '1' then
+                NEXT_CMD_TYPE <= rx_data_10Mbps;
+                checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                Byte_count_10Mbps <= Byte_count_10Mbps + 1;
+                rx_state_10Mbps <= ACK_TYPE;
+            else
+                rx_state_10Mbps <= COMMAND_TYPE;
+            end if;
+
+        ------------------------------------------------
+        -- ACKNOWLEDGEMENT TYPE                                       -- Required to Detect if the Acknowledgement type to understand what acknowledgement need to be sent
+        ------------------------------------------------
+        when ACK_TYPE =>
+            if rx_valid_10Mbps = '1' then
+                NEXT_ACK_BYTE <= rx_data_10Mbps;
+                checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                Byte_count_10Mbps <= Byte_count_10Mbps + 1;
+                rx_state_10Mbps <= DWELL_MSG_ID;
+            else
+                rx_state_10Mbps <= ACK_TYPE;
+            end if;
+            
+        ------------------------------------------------
+        -- DWELL/MSG ID 
+        ------------------------------------------------
+        when DWELL_MSG_ID =>
+            if rx_valid_10Mbps = '1' then
+                NEXT_DWELL_MSG_ID <= rx_data_10Mbps;
+                checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                Byte_count_10Mbps <= Byte_count_10Mbps + 1;
+                rx_state_10Mbps <= CMD_ACK_CHECK;
+            else
+                rx_state_10Mbps <= DWELL_MSG_ID;
+            end if;
+
+        ------------------------------------------------
+        -- COMMAND CHECK & ACKNOWLEDGEMENT CHECK                                        -- Determine the command type and route to the appropriate branch in the FSM
+        ------------------------------------------------
+        when CMD_ACK_CHECK =>
+            -- COMMAND CHECK
+            if ((NEXT_CMD_TYPE = CMD_DWELL) or (NEXT_CMD_TYPE = CMD_RX_PATTERN) or (NEXT_CMD_TYPE = CMD_TX_PATTERN) or (NEXT_CMD_TYPE = CMD_RX_ISOLATION) or (NEXT_CMD_TYPE = CMD_TX_ISOLATION) or (NEXT_CMD_TYPE = CMD_INIT)) then
+                rx_state_10Mbps <= RESERVED;
+            elsif ((NEXT_CMD_TYPE = CMD_RX_CAL) or (NEXT_CMD_TYPE = CMD_TX_CAL)) then
+                rx_state_10Mbps <= CALIBRATION_PAYLOAD;
+            elsif ((NEXT_CMD_TYPE = CMD_STATUS)) then
+                
+            else
+                rx_state_10Mbps <= DWELL_MSG_ID;
+            end if;
+            -- ACKNOWLEDGEMENT CHECK
+            if NEXT_ACK_BYTE = x"00" then
+                Send_ACK_EN <= '0';
+--                rx_state_10Mbps <= DWELL_MSG_ID;
+            elsif NEXT_ACK_BYTE > x"00" then
+                Send_ACK_EN <= '1';
+--                rx_state_10Mbps <= DWELL_MSG_ID;
+            end if;
+
+        ------------------------------------------------
+        -- RESERVED                                                 -- For Dwell/Isolation/Pattern modes
+        ------------------------------------------------
+        when RESERVED =>
+            Send_ACK_EN <= '0';
+            if rx_valid_10Mbps = '1' then
+                NEXT_RESERVE(Reserve_byte_count) <= rx_data_10Mbps;
+                checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                Byte_count_10Mbps <= Byte_count_10Mbps + 1;
+                if Reserve_byte_count = 3 then
+                    Reserve_byte_count <= 0;
+                    if ((NEXT_CMD_TYPE = CMD_DWELL) or (NEXT_CMD_TYPE = CMD_RX_PATTERN) or (NEXT_CMD_TYPE = CMD_TX_PATTERN)) then
+                        rx_state_10Mbps <= DWELL_PATTERN_PAYLOAD;
+                    elsif ((NEXT_CMD_TYPE = CMD_RX_ISOLATION) or (NEXT_CMD_TYPE = CMD_TX_ISOLATION)) then
+                        rx_state_10Mbps <= ISOLATION_PAYLOAD;
+                    elsif (NEXT_CMD_TYPE = CMD_INIT) then
+                        rx_state_10Mbps <= INITIALIZATION;
+                    end if;
+                else
+                    Reserve_byte_count <= Reserve_byte_count + 1;
+                    rx_state_10Mbps <= RESERVED;
+                end if;
+            else
+                rx_state_10Mbps <= RESERVED;
+            end if;
+
+        ------------------------------------------------
+        -- DWELL/PATTERN PAYLOAD LOOP
+        ------------------------------------------------
+        when DWELL_PATTERN_PAYLOAD =>
+            case payload_state is
+                when ELEMENT_TRACKER =>
+                    if rx_valid_10Mbps = '1' then
+                        tx_en_temp <= rx_data_10Mbps(1);
+                        rx_en_temp <= rx_data_10Mbps(0);
+                        Byte_count_10Mbps   <= Byte_count_10Mbps + 1;
+                        checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                        ch_byte_count <= ch_byte_count + 1;
+                        payload_state <= ROW_COL_CALC;
+                    end if;
+            
+                when ROW_COL_CALC =>
+                    row <= ch_count(5 downto 3);
+                    col <= ch_count(2 downto 0);
+                    payload_state <= ADAR_CALC;
+                    
+                when ADAR_CALC =>
+                    adar_idx <= (row(2 downto 1) & col(2 downto 1));
+                    local_row <= row(0);
+                    local_col <= col(0);
+                    payload_state <= LOCAL_CH_CALC;
+                    
+                when LOCAL_CH_CALC =>
+                    if local_row = '0' then
+                        if local_col = '0' then
+                            ch_local <= 2;
+                        else
+                            ch_local <= 3;
+                        end if;
+                        payload_state <= DATA_UPDATE;
+                    else
+                        if local_col = '0' then
+                            ch_local <= 1;
+                        else
+                            ch_local <= 0;
+                        end if;
+                        payload_state <= DATA_UPDATE;
+                    end if;  
+                    
+                when DATA_UPDATE =>
+                    base_idx <= ch_local * 6;
+                    if rx_valid_10Mbps = '1' then
+                        Byte_count_10Mbps   <= Byte_count_10Mbps + 1;
+                        checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                        case ch_byte_count is
+                            when 1 =>       -- 1 : TX PHASE
+                                trx_reg_next(TO_INTEGER(adar_idx))(base_idx + 0) <= PHASE_DATA(to_integer(unsigned(rx_data_10Mbps)))(15 downto 8); -- I
+                                trx_reg_next(TO_INTEGER(adar_idx))(base_idx + 1) <= PHASE_DATA(to_integer(unsigned(rx_data_10Mbps)))(7 downto 0);  -- Q
+
+                            when 2 =>       -- 2 : TX GAIN
+                                trx_reg_next(TO_INTEGER(adar_idx))(base_idx + 2) <= rx_data_10Mbps;
+
+                            when 3 =>       -- 3 : RX PHASE
+                                trx_reg_next(TO_INTEGER(adar_idx))(base_idx + 3) <= PHASE_DATA(to_integer(unsigned(rx_data_10Mbps)))(15 downto 8); -- I
+                                trx_reg_next(TO_INTEGER(adar_idx))(base_idx + 4) <= PHASE_DATA(to_integer(unsigned(rx_data_10Mbps)))(7 downto 0);  -- Q
+
+                            when 4 =>       -- 4 : RX GAIN
+                                trx_reg_next(TO_INTEGER(adar_idx))(base_idx + 5) <= rx_data_10Mbps;
+                                
+                                -- Updating the PA and LNA BIAS and TX/RX Enables
+                                -- bit 7 always 0
+                                trx_reg_next(TO_INTEGER(adar_idx))(30)(7) <= '0';
+                                trx_reg_next(TO_INTEGER(adar_idx))(29)(7) <= '0';
+                                
+                                if tx_en_temp = '1' then
+                                    trx_reg_next(TO_INTEGER(adar_idx))(29)(6 - ch_local) <= '1';
+                                    trx_reg_next(TO_INTEGER(adar_idx))(24 + ch_local) <= PA_BIAS_ON;
+                                    trx_reg_next(TO_INTEGER(adar_idx))(29)(2 downto 0) <= "111";
+                                else
+                                    trx_reg_next(TO_INTEGER(adar_idx))(29)(6 - ch_local) <= '0';
+                                    trx_reg_next(TO_INTEGER(adar_idx))(24 + ch_local) <= PA_BIAS_OFF;
+                                    trx_reg_next(TO_INTEGER(adar_idx))(29)(2 downto 0) <= "000";
+                                end if;
+                                
+                                if rx_en_temp = '1' then
+                                    trx_reg_next(TO_INTEGER(adar_idx))(30)(6 - ch_local) <= '1';
+                                    trx_reg_next(TO_INTEGER(adar_idx))(28) <= LNA_BIAS_ON;
+                                    trx_reg_next(TO_INTEGER(adar_idx))(30)(2 downto 0) <= "111";
+                                else
+                                    trx_reg_next(TO_INTEGER(adar_idx))(30)(6 - ch_local) <= '0';
+                                    trx_reg_next(TO_INTEGER(adar_idx))(28) <= LNA_BIAS_OFF;
+                                    trx_reg_next(TO_INTEGER(adar_idx))(30)(2 downto 0) <= "000";
+                                end if;
+
+                            when others =>
+                                null;
+                        end case;
+
+                        if ch_byte_count = 4 then   -- last byte of this channel
+                            ch_byte_count <= 0;
+                            if ch_count = TOTAL_ELEMENTS - 1 then
+                                if Byte_count_10Mbps = packet_size_10Mbps - 1 then
+                                    ch_count <= (others => '0');
+                                    NEXT_CHECKSUM <= rx_data_10Mbps;
+                                    rx_state_10Mbps <= CHECKSUM;   -- move to checksum state
+                                else
+                                    payload_state <= DATA_UPDATE;
+                                end if;
+                            else
+                                ch_count <= ch_count + 1;
+                                payload_state <= ELEMENT_TRACKER;  -- next channel
+                            end if;
+                        else
+                            ch_byte_count <= ch_byte_count + 1;
+                            payload_state <= DATA_UPDATE;
+                        end if;
+                    else
+                        payload_state <= DATA_UPDATE;
+                    end if;
+                    
+            when others =>
+                null;
+                
+            end case;
+            
+        ------------------------------------------------
+        -- CALIBRATION PAYLOAD LOOP
+        ------------------------------------------------
+        when CALIBRATION_PAYLOAD => 
+            if rx_valid_10Mbps = '1' then
+                Byte_count_10Mbps   <= Byte_count_10Mbps + 1;
+                if Cal_byte_count = 3 then
+                    if Byte_count_10Mbps = packet_size_10Mbps - 1 then
+                        Cal_byte_count <= 0;
+                        NEXT_CHECKSUM <= rx_data_10Mbps;
+                        rx_state_10Mbps <= CHECKSUM;  -- or next state
+                    else
+                        rx_state_10Mbps <= CALIBRATION_PAYLOAD;
+                        checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                    end if;
+                else
+                    Cal_byte_count <= Cal_byte_count + 1;
+                    checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                end if;
+            end if;
+            case Cal_byte_count is
+                when 0 =>
+                    if rx_valid_10Mbps = '1' then
+                        elem_u <= unsigned(rx_data_10Mbps) - 1;
+                    end if;
+                    
+                when 2 =>
+                    if rx_valid_10Mbps = '1' then
+                        trx_reg_next(to_integer(adar_idx))(base_idx + 0) <= PHASE_DATA(to_integer(unsigned(rx_data_10Mbps)))(15 downto 8);
+                        trx_reg_next(to_integer(adar_idx))(base_idx + 1) <= PHASE_DATA(to_integer(unsigned(rx_data_10Mbps)))(7 downto 0);
+                    end if;
+                                        
+                    col <= elem_u(2 downto 0);
+                    row <= elem_u(5 downto 3);
+                    adar_idx <= row(2 downto 1) & col(2 downto 1);
+                    
+                    local_row <= row(0);
+                    local_col <= col(0);
+
+                    if row(1) = '0' then
+                        -- normal orientation
+                        case std_logic_vector'(local_row & local_col) is
+                            when "00" => ch_local <= 0; -- 1
+                            when "01" => ch_local <= 3; -- 4
+                            when "10" => ch_local <= 1; -- 2
+                            when "11" => ch_local <= 2; -- 3
+                        end case;
+                    else
+                        -- flipped orientation
+                        case std_logic_vector'(local_row & local_col) is
+                            when "00" => ch_local <= 2; -- 3
+                            when "01" => ch_local <= 1; -- 2
+                            when "10" => ch_local <= 3; -- 4
+                            when "11" => ch_local <= 0; -- 1
+                        end case;
+                    end if;
+
+                    base_idx <= (ch_local * 6) + 3;
+
+                when 3 =>
+                    if rx_valid_10Mbps = '1' then
+                        if NEXT_CMD_TYPE = CMD_TX_CAL then
+                            trx_reg_next(TO_INTEGER(adar_idx))(32)(6 - ch_local) <= '1';
+                            trx_reg_next(TO_INTEGER(adar_idx))(27 + ch_local) <= PA_BIAS_ON;
+                            trx_reg_next(TO_INTEGER(adar_idx))(32)(2 downto 0) <= "111";
+                            trx_reg_next(to_integer(adar_idx))(base_idx + 2) <= rx_data_10Mbps; --TX atten
+                            trx_reg_next(TO_INTEGER(adar_idx))(34) <= MISC_ENABLES;
+                            trx_reg_next(TO_INTEGER(adar_idx))(35) <= SW_CTRL;
+                            trx_reg_next(TO_INTEGER(adar_idx))(38) <= BIAS_CURRENT_TX;
+                            trx_reg_next(TO_INTEGER(adar_idx))(39) <= BIAS_CURRENT_TX_DRV;
+                            trx_reg_next(TO_INTEGER(adar_idx))(45) <= LD_WRK_REGS_TX;
+                        elsif NEXT_CMD_TYPE = CMD_RX_CAL then
+                            trx_reg_next(TO_INTEGER(adar_idx))(33)(6 - ch_local) <= '1';
+                            trx_reg_next(TO_INTEGER(adar_idx))(31) <= LNA_BIAS_ON;
+                            trx_reg_next(TO_INTEGER(adar_idx))(33)(2 downto 0) <= "111";
+                            trx_reg_next(to_integer(adar_idx))(base_idx + 5) <= rx_data_10Mbps; --RX
+                            --trx_reg_next(TO_INTEGER(adar_idx))(34) <= MISC_ENABLES;
+                            trx_reg_next(TO_INTEGER(adar_idx))(35) <= SW_CTRL;
+                            trx_reg_next(TO_INTEGER(adar_idx))(36) <= BIAS_CURRENT_RX_LNA;
+                            trx_reg_next(TO_INTEGER(adar_idx))(37) <= BIAS_CURRENT_RX;
+                            trx_reg_next(TO_INTEGER(adar_idx))(45) <= LD_WRK_REGS_RX;
+                        else
+                            trx_reg_next(TO_INTEGER(adar_idx))(32)(6 - ch_local) <= '0';
+                            trx_reg_next(TO_INTEGER(adar_idx))(27 + ch_local) <= PA_BIAS_OFF;
+                            trx_reg_next(TO_INTEGER(adar_idx))(32)(2 downto 0) <= "000";
+                            trx_reg_next(TO_INTEGER(adar_idx))(33)(6 - ch_local) <= '0';
+                            trx_reg_next(TO_INTEGER(adar_idx))(31) <= LNA_BIAS_OFF;
+                            trx_reg_next(TO_INTEGER(adar_idx))(33)(2 downto 0) <= "000";
+                        end if;
+                    end if;
+
+                when others =>
+                    null;
+            end case;
+
+        ------------------------------------------------
+        -- ISOLATION PAYLOAD LOOP
+        ------------------------------------------------
+        when ISOLATION_PAYLOAD => 
+            if rx_valid_10Mbps = '1' then
+                Byte_count_10Mbps   <= Byte_count_10Mbps + 1;
+                if iso_byte_count = 3 then
+                    if Byte_count_10Mbps = packet_size_10Mbps - 1 then
+                        iso_byte_count <= 0;
+                        NEXT_CHECKSUM <= rx_data_10Mbps;
+                        rx_state_10Mbps <= CHECKSUM;  -- or next state
+                    else
+                        rx_state_10Mbps <= ISOLATION_PAYLOAD;
+                        checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                    end if;
+                else
+                    iso_byte_count <= iso_byte_count + 1;
+                    checksum_cal_10Mbps <= checksum_cal_10Mbps xor rx_data_10Mbps;
+                end if;
+                NEXT_RESERVE(iso_byte_count) <= rx_data_10Mbps;
+            end if;
+            
+            case iso_byte_count is
+                when 3 =>
+                    if NEXT_CMD_TYPE = CMD_RX_ISOLATION or NEXT_CMD_TYPE = CMD_TX_ISOLATION then                -- RX ISOLATION â†’ RX OFF, TX OFF
+                        -- TX OFF
+                        trx_reg_next(iso_adar_idx)(29)(6 - iso_ch_local) <= '0';
+                        trx_reg_next(iso_adar_idx)(24 + iso_ch_local) <= PA_BIAS_OFF;
+                        trx_reg_next(iso_adar_idx)(29)(2 downto 0) <= "000";
+                        trx_reg_next(iso_adar_idx)(29)(7) <= '0';
+
+                        -- RX OFF
+                        trx_reg_next(iso_adar_idx)(30)(6 - iso_ch_local) <= '0';
+                        trx_reg_next(iso_adar_idx)(28) <= LNA_BIAS_OFF;
+                        trx_reg_next(iso_adar_idx)(30)(2 downto 0) <= "000";
+                        trx_reg_next(iso_adar_idx)(30)(7) <= '0';
+                        
+                    end if;
+
+                    if iso_ch_local = 3 then
+                        if iso_adar_idx < ADAR_COUNT-1 then
+                            iso_ch_local <= 0;
+                        end if;
+                        if iso_adar_idx = ADAR_COUNT-1 then
+                            if Byte_count_10Mbps = packet_size_10Mbps - 1 then
+                                iso_adar_idx <= 0;
+                                iso_ch_local <= 0;
+                            end if;
+                        else
+                            iso_adar_idx <= iso_adar_idx + 1;
+                        end if;
+                    else
+                        iso_ch_local <= iso_ch_local + 1;
+                    end if;
+
+                when others =>
+                    null;
+            end case;
+        
+        when INITIALIZATION => 
+            if rx_valid_10Mbps = '1' then
+                Byte_count_10Mbps   <= Byte_count_10Mbps + 1;
+                NEXT_CHECKSUM <= rx_data_10Mbps;
+                rx_state_10Mbps <= CHECKSUM;
+            else
+                rx_state_10Mbps <= INITIALIZATION;
+            end if;
+            
+        ------------------------------------------------
+        -- CHECKSUM VERIFY
+        ------------------------------------------------
+        when CHECKSUM =>
+            if checksum_cal_10Mbps = NEXT_CHECKSUM then
+                RX_10Mbps_flag  <= '1';
+                Byte_count_10Mbps <= 0;
+                rx_state_10Mbps <= DONE;
+--                if (NEXT_CMD_TYPE = CMD_INIT) and (NEXT_RESERVE(0)(7 downto 4) = INIT_EN_FLAG) then
+--                    Start_Init_sig <= '1';
+--                else
+--                    Start_Init_sig <= '0';
+--                end if;
+            else
+                rx_state_10Mbps <= IDLE;                                    -- checksum doesn't match hence ignore the packet
+                Byte_count_10Mbps <= 0;
+            end if;
+
+        ------------------------------------------------
+        -- DONE (1 cycle pulse)
+        ------------------------------------------------
+        when DONE =>
+            RX_10Mbps_flag <= '0';
+--            Start_Init_sig <= '0';
+            --trx_reg_current <= trx_reg_next;
+            rx_state_10Mbps <= IDLE;
+
+        when others =>
+            rx_state_10Mbps <= IDLE;
+
+        end case;
+    end if;
+end process;
+
+------------------------------------------------------------------
+-- Concurrent Assignments
+------------------------------------------------------------------
+CMD_Aquired <= RX_10Mbps_flag;
+ADAR_NUMBER_NEXT <= to_integer(adar_idx) + 1;
+--Start_Init <= Start_Init_sig;
+
+end Behavioral;
